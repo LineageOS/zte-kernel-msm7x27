@@ -12,7 +12,7 @@
 */
 
 #include <media/v4l2-subdev.h>
-
+#include <mach/iommu_domains.h>
 #include "enc-subdev.h"
 #include "wfd-util.h"
 #include <media/msm/vcd_api.h>
@@ -199,6 +199,40 @@ static void venc_cb(u32 event, u32 status, void *info, u32 size, void *handle,
 				(int)vbuf->v4l2_buf.timestamp.tv_usec,
 				frame_data->frame);
 
+		/*
+		 * Output buffers are enc-subdev and vcd's problem, so
+		 * if buffer is cached, need to flush before giving to
+		 * client. So doing the dirty stuff in this little context
+		 */
+		{
+			unsigned long kvaddr, phys_addr;
+			s32 buffer_index = -1, ion_flags = 0;
+			struct ion_handle *ion_handle;
+			int pmem_fd;
+			struct file *filp;
+			bool rc;
+
+			rc = vidc_lookup_addr_table(client_ctx,
+					BUFFER_TYPE_OUTPUT, true,
+					(unsigned long *)&frame_data->
+					frm_clnt_data, &kvaddr, &phys_addr,
+					&pmem_fd, &filp, &buffer_index);
+
+			if (rc)
+				ion_flags = vidc_get_fd_info(client_ctx,
+					BUFFER_TYPE_OUTPUT, pmem_fd,
+					kvaddr, buffer_index, &ion_handle);
+			else
+				WFD_MSG_ERR("Got an output buffer that we "
+						"couldn't recognize!\n");
+
+			if (msm_ion_do_cache_op(client_ctx->user_ion_client,
+				ion_handle, &kvaddr, frame_data->data_len,
+				ION_IOC_CLEAN_INV_CACHES))
+				WFD_MSG_ERR("OP buffer flush failed\n");
+
+		}
+
 		inst->op_buffer_done(inst->cbdata, status, vbuf);
 		break;
 	case VCD_EVT_RESP_START:
@@ -361,7 +395,7 @@ static long venc_set_buffer_req(struct v4l2_subdev *sd, void *arg)
 	buf_req.max_count = b->count;
 	buf_req.sz = ALIGN(aligned_height * aligned_width, SZ_2K)
 		+ ALIGN(aligned_height * aligned_width * 1/2, SZ_2K);
-	buf_req.align = 0;
+	buf_req.align = SZ_4K;
 	inst->width = b->width;
 	inst->height = b->height;
 	rc = vcd_set_buffer_requirements(client_ctx->vcd_handle,
@@ -1315,21 +1349,262 @@ err:
 	return rc;
 }
 
-static long venc_alloc_input_buffer(struct v4l2_subdev *sd, void *arg)
+static long venc_set_multislicing_mode(struct video_client_ctx *client_ctx,
+			__u32 control, __s32 value)
+{
+	int rc = 0;
+	struct vcd_property_hdr vcd_property_hdr;
+	struct vcd_property_frame_size vcd_frame_size;
+	struct vcd_buffer_requirement vcd_buf_req;
+	struct vcd_property_multi_slice vcd_multi_slice;
+
+	if (!client_ctx) {
+		WFD_MSG_ERR("Invalid parameters\n");
+		rc = -EINVAL;
+		goto set_multislicing_mode_fail;
+	}
+
+	vcd_property_hdr.prop_id = VCD_I_FRAME_SIZE;
+	vcd_property_hdr.sz =
+		sizeof(vcd_frame_size);
+	rc = vcd_get_property(client_ctx->vcd_handle,
+				&vcd_property_hdr, &vcd_frame_size);
+
+	if (rc) {
+		WFD_MSG_ERR("Failed to get frame size\n");
+		goto set_multislicing_mode_fail;
+	}
+
+	rc = vcd_get_buffer_requirements(client_ctx->vcd_handle,
+			VCD_BUFFER_OUTPUT, &vcd_buf_req);
+
+	if (rc) {
+		WFD_MSG_ERR("Failed to get buf reqs\n");
+		goto set_multislicing_mode_fail;
+	}
+
+	vcd_property_hdr.prop_id = VCD_I_MULTI_SLICE;
+	vcd_property_hdr.sz = sizeof(vcd_multi_slice);
+	rc = vcd_get_property(client_ctx->vcd_handle, &vcd_property_hdr,
+			&vcd_multi_slice);
+	if (rc) {
+		WFD_MSG_ERR("Failed to get multi slice\n");
+		goto set_multislicing_mode_fail;
+	}
+
+	switch (control) {
+	case V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_BYTES:
+		if (vcd_multi_slice.m_slice_sel !=
+				VCD_MSLICE_BY_BYTE_COUNT) {
+			WFD_MSG_ERR("Not in proper mode\n");
+			goto set_multislicing_mode_fail;
+		}
+		vcd_multi_slice.m_slice_size = value;
+		break;
+
+	case V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_MB:
+		if (vcd_multi_slice.m_slice_sel !=
+				VCD_MSLICE_BY_MB_COUNT) {
+			WFD_MSG_ERR("Not in proper mode\n");
+			goto set_multislicing_mode_fail;
+		}
+		vcd_multi_slice.m_slice_size = value;
+		break;
+
+	case V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MODE:
+		switch (value) {
+		case V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_SINGLE:
+			vcd_multi_slice.m_slice_sel = VCD_MSLICE_OFF;
+			break;
+		case V4L2_MPEG_VIDEO_MULTI_SICE_MODE_MAX_MB:
+			vcd_multi_slice.m_slice_sel = VCD_MSLICE_BY_MB_COUNT;
+			/* Just a temporary size until client calls
+			 * V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_MB */
+			vcd_multi_slice.m_slice_size =
+				(vcd_frame_size.stride / 16) *
+				(vcd_frame_size.scan_lines / 16);
+			break;
+		case V4L2_MPEG_VIDEO_MULTI_SICE_MODE_MAX_BYTES:
+			vcd_multi_slice.m_slice_sel = VCD_MSLICE_BY_BYTE_COUNT;
+			/* Just a temporary size until client calls
+			 * V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_BYTES */
+			vcd_multi_slice.m_slice_size = vcd_buf_req.sz;
+			break;
+		default:
+			WFD_MSG_ERR("Unrecognized mode %d\n", value);
+			rc = -ENOTSUPP;
+			goto set_multislicing_mode_fail;
+		}
+
+		break;
+	default:
+		rc = -EINVAL;
+		goto set_multislicing_mode_fail;
+	}
+
+	rc = vcd_set_property(client_ctx->vcd_handle, &vcd_property_hdr,
+			&vcd_multi_slice);
+	if (rc) {
+		WFD_MSG_ERR("Failed to set multi slice\n");
+		goto set_multislicing_mode_fail;
+	}
+
+set_multislicing_mode_fail:
+	return rc;
+}
+
+static long venc_get_multislicing_mode(struct video_client_ctx *client_ctx,
+			__u32 control, __s32 *value)
+{
+	int rc = 0;
+	struct vcd_property_hdr vcd_property_hdr;
+	struct vcd_property_frame_size vcd_frame_size;
+	struct vcd_buffer_requirement vcd_buf_req;
+	struct vcd_property_multi_slice vcd_multi_slice;
+
+	if (!client_ctx) {
+		WFD_MSG_ERR("Invalid parameters\n");
+		rc = -EINVAL;
+		goto get_multislicing_mode_fail;
+	}
+
+	vcd_property_hdr.prop_id = VCD_I_FRAME_SIZE;
+	vcd_property_hdr.sz =
+		sizeof(vcd_frame_size);
+	rc = vcd_get_property(client_ctx->vcd_handle,
+				&vcd_property_hdr, &vcd_frame_size);
+
+	if (rc) {
+		WFD_MSG_ERR("Failed to get frame size\n");
+		goto get_multislicing_mode_fail;
+	}
+
+	vcd_property_hdr.prop_id = VCD_I_MULTI_SLICE;
+	vcd_property_hdr.sz = sizeof(vcd_multi_slice);
+	rc = vcd_get_property(client_ctx->vcd_handle, &vcd_property_hdr,
+			&vcd_multi_slice);
+	if (rc) {
+		WFD_MSG_ERR("Failed to get multi slice\n");
+		goto get_multislicing_mode_fail;
+	}
+
+	rc = vcd_get_buffer_requirements(client_ctx->vcd_handle,
+			VCD_BUFFER_OUTPUT, &vcd_buf_req);
+
+	if (rc) {
+		WFD_MSG_ERR("Failed to get buf reqs\n");
+		goto get_multislicing_mode_fail;
+	}
+
+	switch (control) {
+	case V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_BYTES:
+		if (vcd_multi_slice.m_slice_sel == VCD_MSLICE_BY_BYTE_COUNT)
+			*value = vcd_multi_slice.m_slice_size;
+		else {
+			WFD_MSG_ERR("Invalid query when in slice mode %d\n",
+					vcd_multi_slice.m_slice_sel);
+			rc = -EINVAL;
+			goto get_multislicing_mode_fail;
+		}
+		break;
+
+	case V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_MB:
+		if (vcd_multi_slice.m_slice_sel == VCD_MSLICE_BY_MB_COUNT)
+			*value = vcd_multi_slice.m_slice_size;
+		else {
+			WFD_MSG_ERR("Invalid query when in slice mode %d\n",
+					vcd_multi_slice.m_slice_sel);
+			rc = -EINVAL;
+			goto get_multislicing_mode_fail;
+		}
+		break;
+
+	case V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MODE:
+		switch (vcd_multi_slice.m_slice_sel) {
+		case VCD_MSLICE_OFF:
+			*value = V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_SINGLE;
+			break;
+		case VCD_MSLICE_BY_MB_COUNT:
+			*value = V4L2_MPEG_VIDEO_MULTI_SICE_MODE_MAX_MB;
+			break;
+		case VCD_MSLICE_BY_BYTE_COUNT:
+			*value = V4L2_MPEG_VIDEO_MULTI_SICE_MODE_MAX_BYTES;
+			break;
+		default:
+			WFD_MSG_ERR("Encoder in an unknown mode %d\n",
+					vcd_multi_slice.m_slice_sel);
+			rc = -ENOENT;
+			goto get_multislicing_mode_fail;
+
+		}
+		break;
+	default:
+		rc = -EINVAL;
+		goto get_multislicing_mode_fail;
+	}
+
+get_multislicing_mode_fail:
+	return rc;
+}
+
+static long venc_set_input_buffer(struct v4l2_subdev *sd, void *arg)
 {
 	struct mem_region *mregion = arg;
 	struct venc_inst *inst = sd->dev_priv;
+	unsigned long paddr, kvaddr, temp;
 	struct video_client_ctx *client_ctx = &inst->venc_client;
 	int rc = 0;
+
 	if (!client_ctx || !mregion) {
 		WFD_MSG_ERR("Invalid input\n");
-		return -EINVAL;
+		rc = -EINVAL;
+		goto ins_table_fail;
 	}
-	rc = vcd_allocate_buffer(client_ctx->vcd_handle,
-		VCD_BUFFER_INPUT, mregion->size,
-		&mregion->kvaddr, &mregion->paddr);
-	if (rc)
-		WFD_MSG_ERR("Failed to allocate input buffer\n");
+
+	kvaddr = (unsigned long)mregion->kvaddr;
+	paddr = (unsigned long)mregion->paddr;
+
+	if (!kvaddr || !paddr) {
+		WFD_MSG_ERR("Invalid addresses\n");
+		rc = -EINVAL;
+		goto ins_table_fail;
+	}
+
+	/*
+	 * Just a note: the third arg of vidc_insert_\
+	 * addr_table_kernel is supposed to be a userspace
+	 * address that is used as a key in the table. As
+	 * these bufs never leave the kernel, we need to have
+	 * an unique value to use as a key.  So re-using kernel
+	 * virtual addr for this purpose
+	 */
+	rc = vidc_insert_addr_table_kernel(client_ctx,
+		BUFFER_TYPE_INPUT, kvaddr, kvaddr,
+		paddr, 32, mregion->size);
+
+	if (rc == (u32)false) {
+		WFD_MSG_ERR("Failed to insert input buffer into table\n");
+		rc = -EFAULT;
+		goto ins_table_fail;
+	}
+
+	rc = vcd_set_buffer(client_ctx->vcd_handle,
+			VCD_BUFFER_INPUT, (u8 *)kvaddr,
+			mregion->size);
+
+	if (rc) {
+		WFD_MSG_ERR("Failed to set input buffer\n");
+		rc = -EFAULT;
+		goto set_input_buf_fail;
+	}
+
+
+	return rc;
+
+set_input_buf_fail:
+	vidc_delete_addr_table(client_ctx, BUFFER_TYPE_INPUT,
+			kvaddr, &temp);
+ins_table_fail:
 	return rc;
 }
 
@@ -1451,9 +1726,12 @@ static long venc_alloc_recon_buffers(struct v4l2_subdev *sd, void *arg)
 		WFD_MSG_ERR("Failed to get recon buf size\n");
 		goto err;
 	}
-	flags = (0x1<<ION_CP_MM_HEAP_ID);
+	flags = ION_HEAP(ION_CP_MM_HEAP_ID);
 	if (inst->secure)
 		flags |= ION_SECURE;
+	else
+		flags |= ION_HEAP(ION_IOMMU_HEAP_ID);
+
 	if (vcd_get_ion_status()) {
 		for (i = 0; i < 4; ++i) {
 			ctrl = &client_ctx->recon_buffer[i];
@@ -1464,13 +1742,15 @@ static long venc_alloc_recon_buffers(struct v4l2_subdev *sd, void *arg)
 			client_ctx->recon_buffer_ion_handle[i]
 				= ion_alloc(client_ctx->user_ion_client,
 			control.size, SZ_8K, flags);
+
 			ctrl->kernel_virtual_addr = ion_map_kernel(
 				client_ctx->user_ion_client,
 				client_ctx->recon_buffer_ion_handle[i],	0);
 
-			rc = ion_phys(client_ctx->user_ion_client,
+			rc = ion_map_iommu(client_ctx->user_ion_client,
 				client_ctx->recon_buffer_ion_handle[i],
-				&phy_addr, &len);
+				VIDEO_DOMAIN, VIDEO_MAIN_POOL, SZ_4K,
+				0, &phy_addr, (unsigned long *)&len, 0, 0);
 			if (rc) {
 				WFD_MSG_ERR("Failed to allo recon buffers\n");
 				break;
@@ -1522,19 +1802,42 @@ static long venc_free_output_buffer(struct v4l2_subdev *sd, void *arg)
 
 static long venc_free_input_buffer(struct v4l2_subdev *sd, void *arg)
 {
-	int rc = 0;
+	int del_rc = 0, free_rc = 0;
 	struct venc_inst *inst = sd->dev_priv;
 	struct video_client_ctx *client_ctx = &inst->venc_client;
 	struct mem_region *mregion = arg;
+	unsigned long vidc_kvaddr;
+
 	if (!client_ctx || !mregion) {
 		WFD_MSG_ERR("Invalid input\n");
 		return -EINVAL;
 	}
-	rc = vcd_free_buffer(client_ctx->vcd_handle, VCD_BUFFER_INPUT,
-					 mregion->kvaddr);
-	if (rc)
-		WFD_MSG_ERR("Failed to free input buffer\n");
-	return rc;
+
+	del_rc = vidc_delete_addr_table(client_ctx, BUFFER_TYPE_INPUT,
+				(unsigned long)mregion->kvaddr,
+				&vidc_kvaddr);
+	/*
+	 * Even if something went wrong in when
+	 * deleting from table, call vcd_free_buf
+	 */
+	if (del_rc == (u32)false) {
+		WFD_MSG_ERR("Failed to delete buf from address table\n");
+		del_rc = -ENOKEY;
+	} else if ((u8 *)vidc_kvaddr != mregion->kvaddr) {
+		WFD_MSG_ERR("Failed to find expected buffer\n");
+		del_rc = -EINVAL;
+	} else
+		del_rc = 0;
+
+	free_rc = vcd_free_buffer(client_ctx->vcd_handle, VCD_BUFFER_INPUT,
+					 (u8 *)vidc_kvaddr);
+
+	if (free_rc) {
+		WFD_MSG_ERR("Failed to free buffer from encoder\n");
+		free_rc = -EINVAL;
+	}
+
+	return del_rc ? del_rc : free_rc;
 }
 
 static long venc_free_recon_buffers(struct v4l2_subdev *sd, void *arg)
@@ -1556,6 +1859,9 @@ static long venc_free_recon_buffers(struct v4l2_subdev *sd, void *arg)
 				WFD_MSG_ERR("Failed to free recon buffer\n");
 
 			if (client_ctx->recon_buffer_ion_handle[i]) {
+				ion_unmap_iommu(client_ctx->user_ion_client,
+					 client_ctx->recon_buffer_ion_handle[i],
+					 VIDEO_DOMAIN, VIDEO_MAIN_POOL);
 				ion_unmap_kernel(client_ctx->user_ion_client,
 					client_ctx->recon_buffer_ion_handle[i]);
 				ion_free(client_ctx->user_ion_client,
@@ -1726,8 +2032,8 @@ long venc_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 	case SET_FRAMERATE:
 		rc = venc_set_framerate(sd, arg);
 		break;
-	case ALLOC_INPUT_BUFFER:
-		rc = venc_alloc_input_buffer(sd, arg);
+	case SET_INPUT_BUFFER:
+		rc = venc_set_input_buffer(sd, arg);
 		break;
 	case SET_OUTPUT_BUFFER:
 		rc = venc_set_output_buffer(sd, arg);
