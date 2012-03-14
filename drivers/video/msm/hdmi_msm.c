@@ -3858,6 +3858,19 @@ static int hdmi_msm_hpd_on(bool trigger_handler)
 	return 0;
 }
 
+static int hdmi_msm_power_ctrl(boolean enable)
+{
+	if (!external_common_state->hpd_feature_on)
+		return 0;
+
+	if (enable)
+		hdmi_msm_hpd_on(true);
+	else
+		hdmi_msm_hpd_off();
+
+	return 0;
+}
+
 static int hdmi_msm_power_on(struct platform_device *pdev)
 {
 	struct msm_fb_data_type *mfd = platform_get_drvdata(pdev);
@@ -3878,11 +3891,12 @@ static int hdmi_msm_power_on(struct platform_device *pdev)
 	mutex_unlock(&hdmi_msm_state_mutex);
 #endif /* CONFIG_FB_MSM_HDMI_MSM_PANEL_HDCP_SUPPORT */
 
-	if (!hdmi_msm_state->hpd_on_feature) {
-		int rc;
-		rc = hdmi_msm_hpd_on(true);
-		if (!rc) {
-			DEV_INFO("HPD: activation failed: rc=%d\n", rc);
+	changed = hdmi_common_get_video_format_from_drv_data(mfd);
+	if (!external_common_state->hpd_feature_on || mfd->ref_cnt) {
+		int rc = hdmi_msm_hpd_on(true);
+		DEV_INFO("HPD: panel power without 'hpd' feature on\n");
+		if (rc) {
+			DEV_WARN("HPD: activation failed: rc=%d\n", rc);
 			return rc;
 		}
 	}
@@ -3919,6 +3933,8 @@ static int hdmi_msm_power_on(struct platform_device *pdev)
  */
 static int hdmi_msm_power_off(struct platform_device *pdev)
 {
+	struct msm_fb_data_type *mfd = platform_get_drvdata(pdev);
+
 	if (!hdmi_msm_state->hdmi_app_clk)
 		return -ENODEV;
 
@@ -3939,9 +3955,8 @@ static int hdmi_msm_power_off(struct platform_device *pdev)
 	hdmi_msm_dump_regs("HDMI-OFF: ");
 	hdmi_msm_hpd_on(true);
 
-	mutex_lock(&hdmi_msm_state_mutex);
-	if (!hdmi_msm_state->hpd_on_feature) {
-		mutex_unlock(&hdmi_msm_state_mutex);
+	mutex_lock(&external_common_state_hpd_mutex);
+	if (!external_common_state->hpd_feature_on || mfd->ref_cnt)
 		hdmi_msm_hpd_off();
 	} else
 		mutex_unlock(&hdmi_msm_state_mutex);
@@ -4218,6 +4233,7 @@ static struct platform_driver this_driver = {
 static struct msm_fb_panel_data hdmi_msm_panel_data = {
 	.on = hdmi_msm_power_on,
 	.off = hdmi_msm_power_off,
+	.power_ctrl = hdmi_msm_power_ctrl,
 };
 
 static struct platform_device this_device = {

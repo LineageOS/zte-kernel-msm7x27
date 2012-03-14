@@ -587,9 +587,12 @@ static int msm_fb_suspend_sub(struct msm_fb_data_type *mfd)
 static int msm_fb_resume_sub(struct msm_fb_data_type *mfd)
 {
 	int ret = 0;
+	struct msm_fb_panel_data *pdata = NULL;
 
 	if ((!mfd) || (mfd->key != MFD_KEY))
 		return 0;
+
+	pdata = (struct msm_fb_panel_data *)mfd->pdev->dev.platform_data;
 
 	/* attach display channel irq if there's any */
 	if (mfd->channel_irq != 0)
@@ -605,6 +608,9 @@ static int msm_fb_resume_sub(struct msm_fb_data_type *mfd)
 				      mfd->op_enable);
 		if (ret)
 			MSM_FB_INFO("msm_fb_resume: can't turn on display!\n");
+	} else {
+		if (pdata->power_ctrl)
+			pdata->power_ctrl(TRUE);
 	}
 
 	return ret;
@@ -845,6 +851,9 @@ static int msm_fb_blank_sub(int blank_mode, struct fb_info *info,
 			/*msm_fb_set_backlight(mfd, 0);*/
 			/* ZTE_BACKLIGHT_WLY_001 @2009-10-29 backlight go to dim, end*/
 			mfd->op_enable = TRUE;
+		} else {
+			if (pdata->power_ctrl)
+				pdata->power_ctrl(FALSE);
 		}
 		break;
 	}
