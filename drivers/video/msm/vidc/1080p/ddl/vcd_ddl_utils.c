@@ -308,7 +308,7 @@ u32 ddl_fw_init(struct ddl_buf_addr *dram_base)
 
 void ddl_fw_release(void)
 {
-
+	res_trk_close_secure_session();
 }
 
 #ifdef DDL_PROFILE
