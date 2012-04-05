@@ -177,6 +177,11 @@ config FB_MSM_LCDC_OLED_WVGA
 	select FB_MSM_LCDC_PANEL
 	default n
 
+config FB_MSM_LCDC_SKATE_WVGA
+	bool
+	select FB_MSM_LCDC_PANEL
+	default n
+
 config FB_MSM_LCDC_V9_WVGA
 	bool
 	select FB_MSM_LCDC_PANEL
