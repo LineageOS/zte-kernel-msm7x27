@@ -1,0 +1,21 @@
+{
+  "comments": [
+    {
+      "key": {
+        "uuid": "AAAASn//+r4\u003d",
+        "filename": "arch/arm/mach-msm/board-zte-blade2-keypad.c",
+        "patchSetId": 2
+      },
+      "lineNbr": 1,
+      "author": {
+        "id": 1869
+      },
+      "writtenOn": "2012-04-23T03:43:56Z",
+      "side": 1,
+      "message": "Something\u0027s really bad about the line endings.",
+      "revId": "ac36a2a0f64089906f6e6aef916ad3bf23cf2c73",
+      "serverId": "1ec6b3db-b2c1-4fa4-84a2-4c7efe89ba71",
+      "unresolved": false
+    }
+  ]
+}
